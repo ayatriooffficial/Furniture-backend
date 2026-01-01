@@ -16,6 +16,7 @@ const allowedOrigins = [
   "https://www.ayatrio.com",
   "https://ayatrio-web-light.vercel.app",
   "https://furniturefrontend-fawn.vercel.app",
+  "https://furniture-frontend-1.vercel.app",
   // Development (Go Live, localhost variations)
   "http://localhost:5500",
   "http://localhost:5501",
