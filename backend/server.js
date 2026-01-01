@@ -1,0 +1,328 @@
+// backend/server.js
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const mongoose = require("mongoose");
+const cors = require("cors");
+require("dotenv").config(); // Load .env file
+
+const app = express();
+//app.use(cors()); // Allow all origins for initial testing
+
+// CORS configuration - Allow both production and development
+const allowedOrigins = [
+  // Production domains
+  "https://ayatrio.com",
+  "https://www.ayatrio.com",
+  "https://ayatrio-web-light.vercel.app",
+  // Development (Go Live, localhost variations)
+  "http://localhost:5500",
+  "http://localhost:5501",
+  "http://127.0.0.1:5500",
+  "http://127.0.0.1:5501",
+  "http://localhost:5000",
+  "http://127.0.0.1:5000",
+];
+
+app.use(
+  cors({
+    origin: allowedOrigins,
+    credentials: true,
+  })
+);
+
+// Middleware to parse JSON request bodies
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const PORT = process.env.PORT || 5000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// ==== 1) MongoDB connection ====
+const MONGO_URI =
+  process.env.MONGO_URI || "mongodb://127.0.0.1:27017/kalium_furniture"; // <- Fallback to local
+
+mongoose
+  .connect(MONGO_URI)
+  .then(() => {
+    console.log("[DB] Connected to MongoDB at", MONGO_URI);
+  })
+  .catch((err) => {
+    console.error("[DB] MongoDB connection error:", err.message);
+  });
+
+// ==== 2) API routes ====
+const productRoutes = require("./routes/products");
+const categoryRoutes = require("./routes/categories");
+const subcategoryRoutes = require("./routes/subcategories");
+
+// Health check used by api-client.js
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.use("/api/products", productRoutes);
+app.use("/api/categories", categoryRoutes);
+app.use("/api/subcategories", subcategoryRoutes);
+
+// Models for Sitemap
+const Product = require("./models/Product");
+const Category = require("./models/Category");
+const Subcategory = require("./models/Subcategory");
+
+// ==== Sitemap Route ====
+app.get("/sitemap.xml", async (req, res) => {
+  try {
+    const baseUrl = BASE_URL;
+    const products = await Product.find({ isActive: true });
+    const categories = await Category.find({});
+    const subcategories = await Subcategory.find({});
+
+    let xml = '<?xml version="1.0" encoding="UTF-8"?>';
+    xml += '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';
+
+    // Static Pages
+    xml += `
+    <url>
+      <loc>${baseUrl}/</loc>
+      <changefreq>daily</changefreq>
+      <priority>1.0</priority>
+    </url>`;
+
+    // Categories
+    categories.forEach((cat) => {
+      xml += `
+    <url>
+      <loc>${baseUrl}/index_decor/category/${cat.slug}</loc>
+      <changefreq>weekly</changefreq>
+      <priority>0.8</priority>
+    </url>`;
+    });
+
+    // Subcategories
+    subcategories.forEach((sub) => {
+      xml += `
+    <url>
+      <loc>${baseUrl}/index_decor/category/${sub.slug}</loc>
+      <changefreq>weekly</changefreq>
+      <priority>0.8</priority>
+    </url>`;
+    });
+
+    // Products
+    products.forEach((prod) => {
+      xml += `
+    <url>
+      <loc>${baseUrl}/product/${prod.slug}</loc>
+      <changefreq>daily</changefreq>
+      <priority>0.9</priority>
+    </url>`;
+    });
+
+    xml += "</urlset>";
+
+    res.header("Content-Type", "application/xml");
+    res.send(xml);
+  } catch (err) {
+    console.error("[Sitemap] Error generating sitemap:", err);
+    res.status(500).send("Error generating sitemap");
+  }
+});
+
+// ==== 3) Serve frontend static files ====
+// Point to Furniture-frontend folder (go up to sp1, then into Furniture-frontend)
+const FRONTEND_ROOT = path.join(__dirname, "../../Furniture-frontend");
+// Serve static files from the frontend
+app.use(express.static(FRONTEND_ROOT));
+// Moved express.static to the end to allow HTML rewriting
+
+// ==== 4) Rewrite HTML links from original site ====
+function rewriteHtml(html) {
+  html = html.replace(
+    /https:\/\/sites\.kaliumtheme\.com\/elementor\/furniture\/product\/([a-zA-Z0-9\-]+)\/?/g,
+    (m, slug) => {
+      console.log("[Rewrite] Product:", slug);
+      return `/product/${slug}`;
+    }
+  );
+
+  // NEW: Rewrite existing relative links (e.g. /index_tact-mirror.html -> /product/tact-mirror)
+  html = html.replace(/\/index_([a-zA-Z0-9\-]+)\.html/g, (m, slug) => {
+    // Exclude known non-product pages
+    const nonProductSlugs = ["decor", "mirrors", "rugs"];
+
+    if (nonProductSlugs.includes(slug)) {
+      return m; // Keep category pages as is
+    }
+
+    console.log("[Rewrite] Relative Product:", slug);
+    return `/product/${slug}`;
+  });
+
+  // REWRITE: /product-category/slug -> /category/slug
+  html = html.replace(
+    /https:\/\/sites\.kaliumtheme\.com\/elementor\/furniture\/product-category\/([a-zA-Z0-9\-\/]+)\/?/g,
+    (m, slug) => {
+      console.log("[Rewrite] Category Match:", slug);
+      // slug might be "decor" or "decor/mirrors"
+      // For now, just take the last part or the whole thing?
+      // The original code took the first part. Let's stick to that but map to /category/
+      const parts = slug.split("/").filter(Boolean);
+      const categorySlug = parts[parts.length - 1];
+      console.log("[Rewrite] Category Match:", slug, "->", categorySlug);
+      return `/index_decor/category/${categorySlug}`;
+    }
+  );
+
+  // REMOVED: Aggressive rewrite of base URL breaks assets because they are not downloaded locally.
+  // html = html.replace(
+  //   /https:\/\/sites\.kaliumtheme\.com\/elementor\/furniture\//g,
+  //   '/'
+  // );
+
+  html = html.replace(
+    /onclick="window\.location\.href=this\.href; return false;"/g,
+    ""
+  );
+
+  // REWRITE: /wp-content/ -> https://sites.kaliumtheme.com/elementor/furniture/wp-content/
+  // This fixes broken assets on pages that use local absolute paths (like index_mirrors.html)
+  html = html.replace(/["']\/wp-content\/([^"']+)["']/g, (m, path) => {
+    // console.log('[Rewrite] wp-content:', path);
+    return `"https://sites.kaliumtheme.com/elementor/furniture/wp-content/${path}"`;
+  });
+
+  // REWRITE: /wp-includes/ -> https://sites.kaliumtheme.com/elementor/furniture/wp-includes/
+  html = html.replace(/["']\/wp-includes\/([^"']+)["']/g, (m, path) => {
+    return `"https://sites.kaliumtheme.com/elementor/furniture/wp-includes/${path}"`;
+  });
+
+  // REWRITE: Canonical and OpenGraph URLs
+  html = html.replace(
+    /(<link rel="canonical" href="|<meta property="og:url" content=")https:\/\/sites\.kaliumtheme\.com\/elementor\/furniture\//g,
+    `$1${BASE_URL}/`
+  );
+
+  return html;
+}
+
+// ==== 5) Serve HTML pages ====
+
+// NEW: Handle /product/:slug
+app.get("/product/:slug", (req, res) => {
+  const slug = req.params.slug;
+  console.log("[Server] Product request:", slug);
+
+  // Try to find a specific file for this product (legacy support)
+  // e.g. tact-mirror -> index_tact-mirror.html
+  let filename = `index_${slug}.html`;
+  let filePath = path.join(FRONTEND_ROOT, filename);
+
+  if (!fs.existsSync(filePath)) {
+    // Fallback to index_tact-mirror.html as the app shell for products
+    // This ensures we load the PRODUCT PAGE template, not the category template
+    console.log(
+      `[Server] Specific file ${filename} not found, serving index_tact-mirror.html as template`
+    );
+    filePath = path.join(FRONTEND_ROOT, "index_tact-mirror.html");
+  }
+
+  fs.readFile(filePath, "utf8", (err, data) => {
+    if (err) {
+      console.error("[Product] Error reading file:", filePath, err);
+      return res.status(404).send("Not found");
+    }
+    const output = rewriteHtml(data);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(output);
+  });
+});
+
+// NEW: Handle /category/:slug
+app.get("/category/:slug", (req, res) => {
+  serveCategoryPage(req, res);
+});
+
+// NEW: Support /index_decor/category/:slug as requested
+app.get("/index_decor/category/:slug", (req, res) => {
+  serveCategoryPage(req, res);
+});
+
+function serveCategoryPage(req, res) {
+  const slug = req.params.slug;
+  // Map slug to specific file if needed, or default to index_decor.html which seems to be the main template
+  // The user wants "index_decor/category/living" style too, but standard /category/:slug is cleaner.
+  // We will serve index_decor.html for all categories and let api-client.js fetch the right data.
+
+  let filename = `index_${slug}.html`;
+  let filePath = path.join(FRONTEND_ROOT, filename);
+
+  if (!fs.existsSync(filePath)) {
+    // Fallback to index_decor.html as the generic category template
+    console.log(
+      `[Server] Specific category file ${filename} not found, serving index_decor.html`
+    );
+    filename = "index_decor.html";
+    filePath = path.join(FRONTEND_ROOT, filename);
+  }
+
+  if (!fs.existsSync(filePath)) {
+    console.log(`[Server] ${filename} not found, falling back to index.html`);
+    filePath = path.join(FRONTEND_ROOT, "index.html");
+  }
+
+  fs.readFile(filePath, "utf8", (err, data) => {
+    if (err) {
+      console.error("[Category] Error reading file:", filePath, err);
+      return res.status(404).send("Not found");
+    }
+
+    const output = rewriteHtml(data);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(output);
+  });
+}
+
+// Serve specific HTML files (legacy or direct access) and root
+app.get(["/*.html", "/"], (req, res) => {
+  let reqPath = req.path;
+  if (reqPath === "/") reqPath = "/index.html";
+
+  const filePath = path.join(FRONTEND_ROOT, reqPath);
+
+  fs.readFile(filePath, "utf8", (err, data) => {
+    if (err) {
+      console.log(
+        "[HTML] Not found:",
+        filePath,
+        "Falling back to index_decor.html"
+      );
+      // Fallback to index_decor.html for dynamic product pages
+      const fallbackPath = path.join(FRONTEND_ROOT, "index_decor.html");
+      fs.readFile(fallbackPath, "utf8", (err2, data2) => {
+        if (err2) {
+          console.error("[HTML] Fallback not found:", fallbackPath);
+          return res.status(404).send("Not found");
+        }
+        const output = rewriteHtml(data2);
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.send(output);
+      });
+      return;
+    }
+
+    const output = rewriteHtml(data);
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(output);
+  });
+});
+
+// Serve static files (CSS, JS, Images) - placed after HTML routes to allow rewriting
+app.use(express.static(FRONTEND_ROOT, { index: false }));
+app.use(express.static(path.join(__dirname, "public")));
+
+// ==== 6) Start server ====
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+  console.log(`Serving frontend from: ${FRONTEND_ROOT}`);
+});
